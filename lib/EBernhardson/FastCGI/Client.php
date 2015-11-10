@@ -365,14 +365,21 @@ class Client
      * @throws CommunicationException
      * @throws TimedOutException
      */
-    protected function readPacket($timeoutMs)
+    protected function readPacket($timeoutMs = 0)
     {
         $s = [$this->sock];
-        $a = [];
-        socket_select($s, $a, $a, floor($timeoutMs / 1000), ($timeoutMs % 1000) * 1000);
+        $a = []; // Used for error and write arguments; docs suggest error-argument is not too helpful
+        if (!$timeoutMs) {
+            // NULL=indefinite, 0=return immediately
+            socket_select($s, $a, $a, null);
+        } else {
+            // Careful with timeouts -- they are not implemented consistently across platforms
+            socket_select($s, $a, $a, floor($timeoutMs / 1000), ($timeoutMs % 1000) * 1000);
+        }
 
-        $packet = socket_read($this->sock, self::HEADER_LEN);
-        if ($packet === false) {
+        // Force-wait for entire header packet
+        $numBytes = socket_recv($this->sock, $packet, self::HEADER_LEN, MSG_WAITALL);
+        if ($numBytes === false) {
             $errNo = socket_last_error($this->sock);
             if ($errNo == 110) { // ETIMEDOUT from http://php.net/manual/en/function.socket-last-error.php
                 throw new TimedOutException('Failed reading socket');
@@ -386,21 +393,23 @@ class Client
             throw CommunicationException::socketRead($this->sock);
         }
         if (!$packet) {
+            // According to the FastCGI spec, this should never happen.
+            // Secondly, MSG_WAITALL should force PHP to wait for either an error or HEADER_LEN
             return null;
         }
 
         $resp = $this->decodePacketHeader($packet);
         $resp['content'] = '';
         if ($resp['contentLength']) {
-            $len  = $resp['contentLength'];
-            while ($len && $buf=socket_read($this->sock, $len)) {
-                $len -= strlen($buf);
-                $resp['content'] .= $buf;
+            $numBytes = socket_recv($this->sock, $buffer, $resp['contentLength'], MSG_WAITALL);
+            if ($numBytes === false) {
+                throw CommunicationException::socketRead($this->sock);
             }
+            $resp['content'] = $buffer;
         }
         if ($resp['paddingLength']) {
-            /*$buf = */socket_read($this->sock, $resp['paddingLength']);
-            // throw-away padding...
+            socket_recv($this->sock, $buffer, $resp['paddingLength'], MSG_WAITALL);
+            // throw-away padding, ignore read error at this point
         }
         return $resp;
     }
@@ -420,12 +429,13 @@ class Client
         foreach ($requestedInfo as $info) {
             $request .= $this->buildNvpair($info, '');
         }
-        $ret = socket_write($this->sock, $this->buildPacket(self::GET_VALUES, $request, 0));
+        $request = $this->buildPacket(self::GET_VALUES, $request, 0);
+        $ret = socket_send($this->sock, $request, strlen($request), MSG_EOR);
         if ($ret === false) {
             throw CommunicationException::socketWrite($this->sock);
         }
 
-        $resp = $this->readPacket(0);
+        $resp = $this->readPacket();
         if ($resp['type'] == self::GET_VALUES_RESULT) {
             return $this->readNvpair($resp['content'], $resp['length']);
         } else {
@@ -477,7 +487,7 @@ class Client
 
         $paramsRequest = '';
         foreach ($params as $key => $value) {
-            $paramsRequest .= $this->buildNvpair($key, $value, $id);
+            $paramsRequest .= $this->buildNvpair($key, $value);
         }
         if ($paramsRequest) {
             $request .= $this->buildPacket(self::PARAMS, $paramsRequest, $id);
@@ -489,7 +499,7 @@ class Client
         }
         $request .= $this->buildPacket(self::STDIN, '', $id);
 
-        if (false === socket_write($this->sock, $request)) {
+        if (false === socket_send($this->sock, $request, strlen($request), MSG_EOR)) {
             // The developer may wish to close() and re-open the socket
             throw CommunicationException::socketWrite($this->sock);
         }
